@@ -59,11 +59,13 @@ jobs:
           pip install pytest pytest-asyncio pytest-cov ruff mypy
 
       - name: Run Ruff (linting)
+        continue-on-error: true
         run: |
           ruff check . --output-format=github || true
           ruff format . --check || true
 
       - name: Run MyPy (type checking)
+        continue-on-error: true
         run: |
           mypy --ignore-missing-imports . || true
 
