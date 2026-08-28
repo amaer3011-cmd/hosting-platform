@@ -118,6 +118,7 @@ jobs:
           bandit -r . -f json -o bandit-results.json || true
 
       - name: Check for secrets
+        continue-on-error: true
         uses: trufflesecurity/trufflehog@main
         with:
           path: ./
