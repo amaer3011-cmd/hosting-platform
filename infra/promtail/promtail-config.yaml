@@ -1,0 +1,40 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: hosting-logs
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: hosting-platform
+          service: "{{__meta_docker_container_name}}"
+          __path__: /var/log/app/*.log
+    pipeline_stages:
+      - docker: {}
+      - match:
+          selector: '{service=~"hosting-.*"}'
+          stages:
+            - json:
+                expressions:
+                  timestamp: timestamp
+                  level: level
+                  logger: logger
+                  message: message
+                  bot_id: bot_id
+                  user_id: user_id
+            - timestamp:
+                source: timestamp
+                format: RFC3339
+            - labels:
+                level:
+                logger:
+                bot_id:
+                user_id:

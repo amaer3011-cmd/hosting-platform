@@ -1,0 +1,391 @@
+version: '3.8'
+
+services:
+  # Reverse Proxy - Traefik (automatic HTTPS via Let's Encrypt)
+  traefik:
+    image: traefik:v3.0
+    command:
+      - "--api.dashboard=true"
+      - "--api.insecure=false"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-admin@example.com}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+      - "--log.level=INFO"
+      - "--accesslog=true"
+      - "--accesslog.format=json"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"  # Traefik dashboard (restrict in production!)
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "letsencrypt:/letsencrypt"
+      - "./traefik/traefik.yml:/etc/traefik/traefik.yml:ro"
+    networks:
+      - proxy
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.${DOMAIN:-localhost}`)"
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.traefik.service=api@internal"
+      - "traefik.http.routers.traefik.middlewares=traefik-auth"
+      - "traefik.http.middlewares.traefik-auth.basicauth.users=${TRAEFIK_AUTH:-admin:$$apr1$$H6uskkkW$$IgXLP6ewTrSuBkTrqE8wj/}"  # admin/admin - CHANGE!
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Main Application - FastAPI + aiogram
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+      target: runtime
+    image: ${REGISTRY:-ghcr.io}/${PROJECT_NAME:-telegram-hosting}:${VERSION:-latest}
+    command: >
+      sh -c "
+        python -m alembic upgrade head &&
+        python -m gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:8000 --timeout 120 --access-logfile - --error-logfile -
+      "
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      - REDIS_URL=redis://redis:6379/0
+      - BOT_TOKEN=${BOT_TOKEN}
+      - ADMIN_IDS=${ADMIN_IDS}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - SECRET_KEY=${SECRET_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-50}
+      - MAX_BOT_MEMORY_MB=${MAX_BOT_MEMORY_MB:-1024}
+      - BACKUP_DIR=/app/backups
+      - BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-14}
+      - BACKUP_INTERVAL_SECONDS=${BACKUP_INTERVAL_SECONDS:-3600}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DOMAIN=${DOMAIN}
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+    volumes:
+      - "bot_data:/app/bots"
+      - "backup_data:/app/backups"
+      - "./logs:/app/logs"
+    networks:
+      - proxy
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      # Dashboard
+      - "traefik.http.routers.dashboard.rule=Host(`dashboard.${DOMAIN:-localhost}`)"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.dashboard.service=dashboard"
+      - "traefik.http.services.dashboard.loadbalancer.server.port=8000"
+      # Health check endpoint (public)
+      - "traefik.http.routers.health.rule=Host(`${DOMAIN:-localhost}`) && PathPrefix(`/health`)"
+      - "traefik.http.routers.health.entrypoints=websecure"
+      - "traefik.http.routers.health.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.health.service=health"
+      - "traefik.http.services.health.loadbalancer.server.port=8000"
+      # Webhook endpoints (public, rate limited)
+      - "traefik.http.routers.webhook.rule=Host(`${DOMAIN:-localhost}`) && PathPrefix(`/webhook`)"
+      - "traefik.http.routers.webhook.entrypoints=websecure"
+      - "traefik.http.routers.webhook.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.webhook.service=webhook"
+      - "traefik.http.services.webhook.loadbalancer.server.port=8000"
+      - "traefik.http.routers.webhook.middlewares=webhook-ratelimit"
+      - "traefik.http.middlewares.webhook-ratelimit.ratelimit.burst=50"
+      - "traefik.http.middlewares.webhook-ratelimit.ratelimit.average=30"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Background Workers - for heavy tasks (backups, broadcasts, cleanup)
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+      target: runtime
+    image: ${REGISTRY:-ghcr.io}/${PROJECT_NAME:-telegram-hosting}:${VERSION:-latest}
+    command: >
+      sh -c "
+        python -m celery -A workers.celery_app worker -l INFO -Q backups,broadcasts,cleanup --concurrency=2
+      "
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      - REDIS_URL=redis://redis:6379/0
+      - BOT_TOKEN=${BOT_TOKEN}
+      - ADMIN_IDS=${ADMIN_IDS}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - SECRET_KEY=${SECRET_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-50}
+      - MAX_BOT_MEMORY_MB=${MAX_BOT_MEMORY_MB:-1024}
+      - BACKUP_DIR=/app/backups
+      - BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-14}
+      - BACKUP_INTERVAL_SECONDS=${BACKUP_INTERVAL_SECONDS:-3600}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+    volumes:
+      - "bot_data:/app/bots"
+      - "backup_data:/app/backups"
+      - "./logs:/app/logs"
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    restart: unless-stopped
+
+  # Scheduler - periodic tasks (backups, cleanup, health checks)
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+      target: runtime
+    image: ${REGISTRY:-ghcr.io}/${PROJECT_NAME:-telegram-hosting}:${VERSION:-latest}
+    command: >
+      sh -c "
+        python -m celery -A workers.celery_app beat -l INFO --scheduler celery.schedulers:PersistentScheduler
+      "
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      - REDIS_URL=redis://redis:6379/0
+      - BOT_TOKEN=${BOT_TOKEN}
+      - ADMIN_IDS=${ADMIN_IDS}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - SECRET_KEY=${SECRET_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-50}
+      - MAX_BOT_MEMORY_MB=${MAX_BOT_MEMORY_MB:-1024}
+      - BACKUP_DIR=/app/backups
+      - BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-14}
+      - BACKUP_INTERVAL_SECONDS=${BACKUP_INTERVAL_SECONDS:-3600}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+    volumes:
+      - "bot_data:/app/bots"
+      - "backup_data:/app/backups"
+      - "./logs:/app/logs"
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+    restart: unless-stopped
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=${DB_NAME}
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256
+    volumes:
+      - "postgres_data:/var/lib/postgresql/data"
+      - "./init-scripts:/docker-entrypoint-initdb.d:ro"
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    command: >
+      postgres
+      -c max_connections=200
+      -c shared_buffers=256MB
+      -c effective_cache_size=768MB
+      -c maintenance_work_mem=64MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c work_mem=4MB
+      -c min_wal_size=1GB
+      -c max_wal_size=4GB
+
+  # Redis - for caching, rate limiting, Celery broker
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD:-}
+    volumes:
+      - "redis_data:/data"
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Prometheus - Metrics collection
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+      - "--web.enable-admin-api"
+    volumes:
+      - "./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro"
+      - "prometheus_data:/prometheus"
+    networks:
+      - monitoring
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    profiles:
+      - monitoring
+
+  # Grafana - Visualization
+  grafana:
+    image: grafana/grafana:10.3.3
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - "./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro"
+      - "./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro"
+      - "grafana_data:/var/lib/grafana"
+    networks:
+      - monitoring
+      - proxy
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`grafana.${DOMAIN:-localhost}`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+    profiles:
+      - monitoring
+
+  # Loki - Log aggregation
+  loki:
+    image: grafana/loki:2.9.4
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - "./monitoring/loki-config.yaml:/etc/loki/local-config.yaml:ro"
+      - "loki_data:/loki"
+    networks:
+      - monitoring
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  # Promtail - Log shipping
+  promtail:
+    image: grafana/promtail:2.9.4
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - "./logs:/var/log/app:ro"
+      - "./monitoring/promtail-config.yml:/etc/promtail/config.yml:ro"
+    networks:
+      - monitoring
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+networks:
+  proxy:
+    external: false
+  backend:
+    internal: true
+  monitoring:
+    internal: true
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  bot_data:
+    driver: local
+  backup_data:
+    driver: local
+  letsencrypt:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  loki_data:
+    driver: local
